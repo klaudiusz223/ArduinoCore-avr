@@ -20,13 +20,18 @@
   Modified 28 September 2010 by Mark Sproul
   Modified 14 August 2012 by Alarus
   Modified 3 December 2013 by Matthijs Kooijman
+  //--- Modified 21 December 2017 by Sherzaad
+  list of changes:
+  - _tx_udr_empty_irq(void) function updated to make possible 9-bit serial TX
+  - begin function updated to allow 9 bit serial configuration
+  - read/write functions updated to support 9 bit serial
+  ---//
 */
 
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
-#include <util/atomic.h>
 #include "Arduino.h"
 
 #include "HardwareSerial.h"
@@ -77,34 +82,26 @@ void serialEventRun(void)
 #endif
 }
 
-// macro to guard critical sections when needed for large TX buffer sizes
-#if (SERIAL_TX_BUFFER_SIZE>256)
-#define TX_BUFFER_ATOMIC ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
-#else
-#define TX_BUFFER_ATOMIC
-#endif
-
 // Actual interrupt handlers //////////////////////////////////////////////////////////////
 
 void HardwareSerial::_tx_udr_empty_irq(void)
 {
   // If interrupts are enabled, there must be more data in the output
   // buffer. Send the next byte
-  unsigned char c = _tx_buffer[_tx_buffer_tail];
+
+  _tx.val = _tx_buffer[_tx_buffer_tail];
   _tx_buffer_tail = (_tx_buffer_tail + 1) % SERIAL_TX_BUFFER_SIZE;
 
-  *_udr = c;
+  if(bit_is_set(*_ucsrb, UCSZ02)){
+	if(_tx.bytes[1]) sbi(*_ucsrb, TXB80);
+	else cbi(*_ucsrb, TXB80);  
+  } 
+  *_udr = _tx.bytes[0];
 
   // clear the TXC bit -- "can be cleared by writing a one to its bit
   // location". This makes sure flush() won't return until the bytes
-  // actually got written. Other r/w bits are preserved, and zeroes
-  // written to the rest.
-
-#ifdef MPCM0
-  *_ucsra = ((*_ucsra) & ((1 << U2X0) | (1 << MPCM0))) | (1 << TXC0);
-#else
-  *_ucsra = ((*_ucsra) & ((1 << U2X0) | (1 << TXC0)));
-#endif
+  // actually got written
+  sbi(*_ucsra, TXC0);
 
   if (_tx_buffer_head == _tx_buffer_tail) {
     // Buffer empty, so disable interrupts
@@ -118,6 +115,8 @@ void HardwareSerial::begin(unsigned long baud, byte config)
 {
   // Try u2x mode first
   uint16_t baud_setting = (F_CPU / 4 / baud - 1) / 2;
+  uint8_t config1 = config & 0x7F;
+  
   *_ucsra = 1 << U2X0;
 
   // hardcoded exception for 57600 for compatibility with the bootloader
@@ -139,14 +138,19 @@ void HardwareSerial::begin(unsigned long baud, byte config)
 
   //set the data bits, parity, and stop bits
 #if defined(__AVR_ATmega8__)
-  config |= 0x80; // select UCSRC register (shared with UBRRH)
+  config1 |= 0x80; // select UCSRC register (shared with UBRRH)
 #endif
-  *_ucsrc = config;
+  *_ucsrc = config1;
   
   sbi(*_ucsrb, RXEN0);
   sbi(*_ucsrb, TXEN0);
   sbi(*_ucsrb, RXCIE0);
   cbi(*_ucsrb, UDRIE0);
+  
+  // set the 9 bit character size if required
+  if(bit_is_set(config,7)) sbi(*_ucsrb, UCSZ02);
+  else cbi(*_ucsrb, UCSZ02);
+
 }
 
 void HardwareSerial::end()
@@ -183,21 +187,24 @@ int HardwareSerial::read(void)
   if (_rx_buffer_head == _rx_buffer_tail) {
     return -1;
   } else {
-    unsigned char c = _rx_buffer[_rx_buffer_tail];
-    _rx_buffer_tail = (rx_buffer_index_t)(_rx_buffer_tail + 1) % SERIAL_RX_BUFFER_SIZE;
+		uint16_t c = _rx_buffer[_rx_buffer_tail];
+		if(bit_is_clear(*_ucsrb, UCSZ02)) c = (uint8_t)_rx_buffer[_rx_buffer_tail];
+		_rx_buffer_tail = (rx_buffer_index_t)(_rx_buffer_tail + 1) % SERIAL_RX_BUFFER_SIZE;
     return c;
   }
 }
 
 int HardwareSerial::availableForWrite(void)
 {
-  tx_buffer_index_t head;
-  tx_buffer_index_t tail;
-
-  TX_BUFFER_ATOMIC {
-    head = _tx_buffer_head;
-    tail = _tx_buffer_tail;
-  }
+#if (SERIAL_TX_BUFFER_SIZE>256)
+  uint8_t oldSREG = SREG;
+  cli();
+#endif
+  tx_buffer_index_t head = _tx_buffer_head;
+  tx_buffer_index_t tail = _tx_buffer_tail;
+#if (SERIAL_TX_BUFFER_SIZE>256)
+  SREG = oldSREG;
+#endif
   if (head >= tail) return SERIAL_TX_BUFFER_SIZE - 1 - head + tail;
   return tail - head - 1;
 }
@@ -222,30 +229,24 @@ void HardwareSerial::flush()
   // the hardware finished tranmission (TXC is set).
 }
 
-size_t HardwareSerial::write(uint8_t c)
+size_t HardwareSerial::write(uint16_t n)
 {
+	
   _written = true;
+  
+  _tx.val = n & 0x1FF;
   // If the buffer and the data register is empty, just write the byte
   // to the data register and be done. This shortcut helps
   // significantly improve the effective datarate at high (>
   // 500kbit/s) bitrates, where interrupt overhead becomes a slowdown.
   if (_tx_buffer_head == _tx_buffer_tail && bit_is_set(*_ucsra, UDRE0)) {
-    // If TXC is cleared before writing UDR and the previous byte
-    // completes before writing to UDR, TXC will be set but a byte
-    // is still being transmitted causing flush() to return too soon.
-    // So writing UDR must happen first.
-    // Writing UDR and clearing TC must be done atomically, otherwise
-    // interrupts might delay the TXC clear so the byte written to UDR
-    // is transmitted (setting TXC) before clearing TXC. Then TXC will
-    // be cleared when no bytes are left, causing flush() to hang
-    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-      *_udr = c;
-#ifdef MPCM0
-      *_ucsra = ((*_ucsra) & ((1 << U2X0) | (1 << MPCM0))) | (1 << TXC0);
-#else
-      *_ucsra = ((*_ucsra) & ((1 << U2X0) | (1 << TXC0)));
-#endif
-    }
+	if(bit_is_set(*_ucsrb, UCSZ02)){
+		// set the 9th bit character size if required
+		if(_tx.bytes[1]) sbi(*_ucsrb, TXB80);
+		else cbi(*_ucsrb, TXB80);   
+	} 
+    *_udr = _tx.bytes[0];
+    sbi(*_ucsra, TXC0);
     return 1;
   }
   tx_buffer_index_t i = (_tx_buffer_head + 1) % SERIAL_TX_BUFFER_SIZE;
@@ -265,15 +266,10 @@ size_t HardwareSerial::write(uint8_t c)
     }
   }
 
-  _tx_buffer[_tx_buffer_head] = c;
-
-  // make atomic to prevent execution of ISR between setting the
-  // head pointer and setting the interrupt flag resulting in buffer
-  // retransmission
-  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-    _tx_buffer_head = i;
-    sbi(*_ucsrb, UDRIE0);
-  }
+  _tx_buffer[_tx_buffer_head] = _tx.val;
+  _tx_buffer_head = i;
+	
+  sbi(*_ucsrb, UDRIE0);
   
   return 1;
 }
