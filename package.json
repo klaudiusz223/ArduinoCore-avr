@@ -1,5 +1,5 @@
 {
-  "name": "framework-arduino-avr",
+  "name": "framework-arduino-avr-9bit",
   "version": "5.1.0",
   "description": "The official Arduino Wiring-based Framework for Microchip AVR microcontrollers",
   "keywords": [
@@ -12,6 +12,6 @@
   "license": "LGPL-2.1-or-later",
   "repository": {
     "type": "git",
-    "url": "https://github.com/arduino/ArduinoCore-avr"
+    "url": "https://github.com/klaudiusz223/ArduinoCore-avr"
   }
 }
